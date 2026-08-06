@@ -6,9 +6,7 @@ import traceback
 from typing import Any
 
 import runpod
-import torch
 from PIL import Image, ImageOps
-from diffusers import QwenImageEditPlusPipeline
 
 
 MODEL_ID = os.getenv("MODEL_NAME", "Qwen/Qwen-Image-Edit-2511")
@@ -19,7 +17,7 @@ _PIPELINE = None
 
 
 def resolve_cached_model(model_id: str) -> str:
-    """Return RunPod cached-model snapshot when available, otherwise the HF model ID."""
+    """Return the RunPod cached-model snapshot when available."""
     if "/" not in model_id:
         return model_id
 
@@ -33,28 +31,33 @@ def resolve_cached_model(model_id: str) -> str:
             revision = file.read().strip()
         candidate = os.path.join(snapshots_dir, revision)
         if os.path.isdir(candidate):
-            print(f"[model] Using cached snapshot: {candidate}")
+            print(f"[model] Using cached snapshot: {candidate}", flush=True)
             return candidate
 
     candidates = sorted(glob.glob(os.path.join(snapshots_dir, "*")))
     for candidate in candidates:
         if os.path.isdir(candidate):
-            print(f"[model] Using cached snapshot fallback: {candidate}")
+            print(f"[model] Using cached snapshot fallback: {candidate}", flush=True)
             return candidate
 
-    print(f"[model] Cached snapshot unavailable; using Hugging Face ID: {model_id}")
+    print(f"[model] Cached snapshot unavailable; using Hugging Face ID: {model_id}", flush=True)
     return model_id
 
 
-def get_pipeline() -> QwenImageEditPlusPipeline:
+def get_pipeline():
+    """Load the heavy ML libraries lazily so the worker can boot first."""
     global _PIPELINE
     if _PIPELINE is not None:
         return _PIPELINE
 
+    print("[model] Importing torch and diffusers...", flush=True)
+    import torch
+    from diffusers import QwenImageEditPlusPipeline
+
     model_path = resolve_cached_model(MODEL_ID)
     local_only = os.path.isdir(model_path)
 
-    print(f"[model] Loading {model_path}")
+    print(f"[model] Loading pipeline from: {model_path}", flush=True)
     pipeline = QwenImageEditPlusPipeline.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -62,14 +65,13 @@ def get_pipeline() -> QwenImageEditPlusPipeline:
         low_cpu_mem_usage=True,
     )
 
-    # Required for a 20B BF16 model on a 24 GB GPU. It trades speed for lower VRAM use.
     pipeline.enable_model_cpu_offload()
     pipeline.enable_vae_slicing()
     pipeline.enable_vae_tiling()
     pipeline.set_progress_bar_config(disable=True)
 
     _PIPELINE = pipeline
-    print("[model] Pipeline ready")
+    print("[model] Pipeline ready", flush=True)
     return _PIPELINE
 
 
@@ -79,15 +81,16 @@ def decode_image(value: str) -> Image.Image:
 
     encoded = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
     raw = base64.b64decode(encoded, validate=False)
+
     image = Image.open(io.BytesIO(raw))
     image = ImageOps.exif_transpose(image).convert("RGB")
 
     if max(image.size) > MAX_SIDE:
         image.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
 
-    # Qwen performs best with dimensions divisible by 16.
     width = max(64, image.width - image.width % 16)
     height = max(64, image.height - image.height % 16)
+
     if (width, height) != image.size:
         image = image.resize((width, height), Image.Resampling.LANCZOS)
 
@@ -118,6 +121,10 @@ def validate_job_input(job_input: dict[str, Any]) -> tuple[Image.Image, Image.Im
 
 def handler(job: dict[str, Any]) -> dict[str, Any]:
     try:
+        import torch
+
+        print("[job] Request received", flush=True)
+
         job_input = job.get("input") or {}
         base_image, reference_image, prompt = validate_job_input(job_input)
 
@@ -137,6 +144,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         pipeline = get_pipeline()
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
+        print("[job] Starting image generation", flush=True)
+
         with torch.inference_mode():
             result = pipeline(
                 image=[base_image, reference_image],
@@ -148,6 +157,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 guidance_scale=1.0,
                 num_images_per_prompt=1,
             ).images[0]
+
+        print("[job] Generation completed", flush=True)
 
         return {
             "ok": True,
@@ -167,4 +178,5 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
+    print("[worker] Starting Motion Studio RunPod worker", flush=True)
     runpod.serverless.start({"handler": handler})
