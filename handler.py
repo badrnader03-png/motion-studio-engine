@@ -1,46 +1,55 @@
 import base64
-import glob
 import io
 import os
+import tempfile
 import traceback
 from typing import Any
 
+import numpy as np
 import runpod
+import torch
 from PIL import Image, ImageOps
+from diffusers import WanImageToVideoPipeline
+from diffusers.utils import export_to_video
 
+MODEL_ID = os.getenv(
+    "MODEL_NAME",
+    "TestOrganizationPleaseIgnore/WAMU_v3_WAN2.2_I2V_LIGHTNING",
+)
+FIXED_FPS = int(os.getenv("FIXED_FPS", "16"))
+MAX_AREA = int(os.getenv("MAX_AREA", str(480 * 832)))
+MIN_FRAMES = 9
+MAX_FRAMES = 161
 
-MODEL_ID = os.getenv("MODEL_NAME", "Qwen/Qwen-Image-Edit-2511")
-CACHE_ROOT = "/runpod-volume/huggingface-cache/hub"
-MAX_SIDE = int(os.getenv("MAX_INPUT_SIDE", "768"))
+DEFAULT_NEGATIVE_PROMPT = (
+    "overexposed, static, blurry details, subtitles, watermark, text, "
+    "low quality, jpeg artifacts, deformed anatomy, extra fingers, "
+    "bad hands, bad face, duplicate person, extra limbs, frozen frame"
+)
 
 _PIPELINE = None
 
 
-def resolve_cached_model(model_id: str) -> str:
-    if "/" not in model_id:
-        return model_id
+def decode_image(value: str) -> Image.Image:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("image is required.")
 
-    org, name = model_id.split("/", 1)
-    model_root = os.path.join(CACHE_ROOT, f"models--{org}--{name}")
-    refs_main = os.path.join(model_root, "refs", "main")
-    snapshots_dir = os.path.join(model_root, "snapshots")
+    encoded = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
+    raw = base64.b64decode(encoded, validate=False)
+    return ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
 
-    if os.path.isfile(refs_main):
-        with open(refs_main, "r", encoding="utf-8") as file:
-            revision = file.read().strip()
-        candidate = os.path.join(snapshots_dir, revision)
-        if os.path.isdir(candidate):
-            print(f"[model] Using cached snapshot: {candidate}", flush=True)
-            return candidate
 
-    candidates = sorted(glob.glob(os.path.join(snapshots_dir, "*")))
-    for candidate in candidates:
-        if os.path.isdir(candidate):
-            print(f"[model] Using cached snapshot fallback: {candidate}", flush=True)
-            return candidate
+def normalize_num_frames(value: int) -> int:
+    value = max(MIN_FRAMES, min(MAX_FRAMES, int(value)))
+    # Wan temporal VAE is happiest with 4k+1 frame counts.
+    k = round((value - 1) / 4)
+    return max(MIN_FRAMES, min(MAX_FRAMES, 4 * k + 1))
 
-    print(f"[model] Cached snapshot unavailable; using Hugging Face ID: {model_id}", flush=True)
-    return model_id
+
+def get_num_frames(duration: float, requested_frames: Any = None) -> int:
+    if requested_frames not in (None, ""):
+        return normalize_num_frames(int(requested_frames))
+    return normalize_num_frames(int(round(duration * FIXED_FPS)) + 1)
 
 
 def get_pipeline():
@@ -48,121 +57,136 @@ def get_pipeline():
     if _PIPELINE is not None:
         return _PIPELINE
 
-    print("[model] Importing torch and diffusers...", flush=True)
-    import torch
-    from diffusers import QwenImageEditPlusPipeline
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required.")
 
-    model_path = resolve_cached_model(MODEL_ID)
-    local_only = os.path.isdir(model_path)
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
 
-    print(f"[model] Loading pipeline from: {model_path}", flush=True)
-    pipeline = QwenImageEditPlusPipeline.from_pretrained(
-        model_path,
+    print(f"[model] Loading Wan I2V: {MODEL_ID}", flush=True)
+
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        MODEL_ID,
         torch_dtype=torch.bfloat16,
-        local_files_only=local_only,
+        token=token,
         low_cpu_mem_usage=True,
     )
 
-    # Supported memory optimization for this pipeline.
-    pipeline.enable_model_cpu_offload()
-    pipeline.set_progress_bar_config(disable=True)
+    # Keep the 48 GB worker viable by offloading inactive modules to CPU.
+    pipe.enable_model_cpu_offload()
 
-    _PIPELINE = pipeline
-    print("[model] Pipeline ready", flush=True)
+    if getattr(pipe, "vae", None) is not None:
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
+        try:
+            pipe.vae.enable_slicing()
+        except Exception:
+            pass
+
+    pipe.set_progress_bar_config(disable=False)
+    _PIPELINE = pipe
+
+    print("[model] Wan I2V ready", flush=True)
     return _PIPELINE
 
 
-def decode_image(value: str) -> Image.Image:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("Image must be a non-empty base64 string or data URL.")
+def resize_for_wan(image: Image.Image, pipe) -> Image.Image:
+    aspect_ratio = image.height / image.width
 
-    encoded = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
-    raw = base64.b64decode(encoded, validate=False)
+    # Same sizing idea as the official Wan2.2 Diffusers example.
+    mod_value = 16
+    try:
+        mod_value = (
+            pipe.vae_scale_factor_spatial
+            * pipe.transformer.config.patch_size[1]
+        )
+    except Exception:
+        pass
 
-    image = Image.open(io.BytesIO(raw))
-    image = ImageOps.exif_transpose(image).convert("RGB")
+    height = max(mod_value, round(np.sqrt(MAX_AREA * aspect_ratio)) // mod_value * mod_value)
+    width = max(mod_value, round(np.sqrt(MAX_AREA / aspect_ratio)) // mod_value * mod_value)
 
-    if max(image.size) > MAX_SIDE:
-        image.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
-
-    width = max(64, image.width - image.width % 16)
-    height = max(64, image.height - image.height % 16)
-
-    if (width, height) != image.size:
-        image = image.resize((width, height), Image.Resampling.LANCZOS)
-
-    return image
+    return image.resize((int(width), int(height)), Image.Resampling.LANCZOS)
 
 
-def encode_image(image: Image.Image) -> str:
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-
-def validate_job_input(job_input: dict[str, Any]) -> tuple[Image.Image, Image.Image, str]:
-    prompt = str(job_input.get("prompt", "")).strip()
-    if len(prompt) < 3:
-        raise ValueError("prompt is required.")
-
-    base_value = job_input.get("base_image")
-    reference_value = job_input.get("reference_image")
-
-    if not base_value:
-        raise ValueError("base_image is required.")
-    if not reference_value:
-        raise ValueError("reference_image is required.")
-
-    return decode_image(base_value), decode_image(reference_value), prompt
+def encode_video(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
 
 def handler(job: dict[str, Any]) -> dict[str, Any]:
+    video_path = None
+
     try:
-        import torch
-
-        print("[job] Request received", flush=True)
-
         job_input = job.get("input") or {}
-        base_image, reference_image, prompt = validate_job_input(job_input)
 
-        seed = int(job_input.get("seed", 0))
-        steps = max(8, min(int(job_input.get("steps", 20)), 40))
-        true_cfg_scale = max(1.0, min(float(job_input.get("true_cfg_scale", 4.0)), 8.0))
-        negative_prompt = str(job_input.get("negative_prompt", " "))
+        image_value = job_input.get("image")
+        if not image_value:
+            raise ValueError("image is required.")
 
-        full_prompt = (
-            "Image 1 is the BASE image and the only identity reference. "
-            "Preserve the person's facial identity and distinguishing characteristics from Image 1. "
-            "Image 2 is the REFERENCE image. Copy only the elements requested by the user. "
-            "Do not blend the identities and do not copy the face from Image 2. "
-            f"User instruction: {prompt}"
+        prompt = str(job_input.get("prompt", "")).strip()
+        if len(prompt) < 3:
+            raise ValueError("prompt is required.")
+
+        duration = max(0.5, min(10.0, float(job_input.get("duration", 3.5))))
+        num_frames = get_num_frames(duration, job_input.get("num_frames"))
+        actual_duration = (num_frames - 1) / FIXED_FPS
+
+        steps = max(1, min(30, int(job_input.get("steps", 4))))
+        guidance_scale = max(0.0, min(20.0, float(job_input.get("guidance_scale", 1.0))))
+        seed = int(job_input.get("seed", 42))
+        negative_prompt = str(
+            job_input.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
         )
 
-        pipeline = get_pipeline()
+        pipe = get_pipeline()
+        image = resize_for_wan(decode_image(image_value), pipe)
+
+        print(
+            f"[job] Wan I2V {image.width}x{image.height}; "
+            f"frames={num_frames}; fps={FIXED_FPS}; "
+            f"steps={steps}; guidance={guidance_scale}; seed={seed}",
+            flush=True,
+        )
+
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
-        print("[job] Starting image generation", flush=True)
-
         with torch.inference_mode():
-            result = pipeline(
-                image=[base_image, reference_image],
-                prompt=full_prompt,
-                generator=generator,
-                true_cfg_scale=true_cfg_scale,
+            frames = pipe(
+                image=image,
+                prompt=prompt,
                 negative_prompt=negative_prompt,
+                height=image.height,
+                width=image.width,
+                num_frames=num_frames,
+                guidance_scale=guidance_scale,
                 num_inference_steps=steps,
-                guidance_scale=1.0,
-                num_images_per_prompt=1,
-            ).images[0]
+                generator=generator,
+            ).frames[0]
 
-        print("[job] Generation completed", flush=True)
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        video_path = tmp.name
+        tmp.close()
+
+        export_to_video(frames, video_path, fps=FIXED_FPS)
+        video_b64 = encode_video(video_path)
+
+        print("[job] Video generation complete", flush=True)
 
         return {
             "ok": True,
-            "image_base64": encode_image(result),
-            "mime_type": "image/png",
+            "video_base64": video_b64,
+            "mime_type": "video/mp4",
+            "model": MODEL_ID,
             "seed": seed,
             "steps": steps,
+            "guidance_scale": guidance_scale,
+            "fps": FIXED_FPS,
+            "num_frames": num_frames,
+            "duration": actual_duration,
+            "width": image.width,
+            "height": image.height,
         }
 
     except Exception as error:
@@ -171,9 +195,17 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             "ok": False,
             "error": str(error),
             "error_type": type(error).__name__,
+            "model": MODEL_ID,
         }
+
+    finally:
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
-    print("[worker] Starting Motion Studio RunPod worker", flush=True)
+    print("[worker] Starting Motion Studio Wan 2.2 I2V", flush=True)
     runpod.serverless.start({"handler": handler})

@@ -4,13 +4,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/runpod-volume/huggingface-cache \
+    HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub \
     TRANSFORMERS_CACHE=/runpod-volume/huggingface-cache \
-    MAX_INPUT_SIDE=768
+    MODEL_NAME=TestOrganizationPleaseIgnore/WAMU_v3_WAN2.2_I2V_LIGHTNING \
+    FIXED_FPS=16 \
+    MAX_AREA=399360
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    ffmpeg \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
