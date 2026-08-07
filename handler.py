@@ -119,11 +119,15 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     video_path = None
 
     try:
+        print("[job] JOB RECEIVED", flush=True)
         job_input = job.get("input") or {}
 
-        image_value = job_input.get("image")
+        # Accept both the new I2V field name and the old frontend field name.
+        image_value = job_input.get("image") or job_input.get("base_image")
         if not image_value:
-            raise ValueError("image is required.")
+            raise ValueError("image or base_image is required.")
+
+        print("[job] IMAGE RECEIVED", flush=True)
 
         prompt = str(job_input.get("prompt", "")).strip()
         if len(prompt) < 3:
@@ -140,8 +144,12 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             job_input.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
         )
 
+        print("[job] MODEL LOADING", flush=True)
         pipe = get_pipeline()
+        print("[job] MODEL READY", flush=True)
+
         image = resize_for_wan(decode_image(image_value), pipe)
+        print(f"[job] IMAGE DECODED {image.width}x{image.height}", flush=True)
 
         print(
             f"[job] Wan I2V {image.width}x{image.height}; "
@@ -151,6 +159,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         )
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
+
+        print("[job] GENERATING", flush=True)
 
         with torch.inference_mode():
             frames = pipe(
@@ -172,7 +182,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         export_to_video(frames, video_path, fps=FIXED_FPS)
         video_b64 = encode_video(video_path)
 
-        print("[job] Video generation complete", flush=True)
+        print("[job] GENERATION COMPLETE", flush=True)
 
         return {
             "ok": True,
@@ -207,5 +217,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[worker] Starting Motion Studio Wan 2.2 I2V", flush=True)
+    print("[worker] WORKER STARTED — Motion Studio Wan 2.2 I2V", flush=True)
+    print(f"[worker] MODEL_NAME={MODEL_ID}", flush=True)
+    print(f"[worker] FPS={FIXED_FPS} MAX_AREA={MAX_AREA}", flush=True)
     runpod.serverless.start({"handler": handler})
