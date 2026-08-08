@@ -170,6 +170,13 @@
     <div class="hint">لو اخترت الفريمات يدويًا، المحرك يضبط العدد تلقائيًا لأقرب قيمة مناسبة لـWan بصيغة 4k+1 (مثل 49، 65، 81، 97...). عند 16 FPS: 81 فريم ≈ 5 ثواني.</div>
   </section>
 
+  <section class="card">
+    <h3>استرجاع فيديو سابق</h3>
+    <div class="sub">لو الصفحة اتقفلت أو اتعمل Refresh، حط Job ID واضغط استرجاع. سيتم جلب الفيديو من RunPod بدون إعادة توليد.</div>
+    <input id="recoverJobId" type="text" placeholder="Job ID">
+    <button id="recoverJob" class="btn secondary" type="button">استرجاع الفيديو من Job ID</button>
+  </section>
+
   <button id="generate" class="btn" disabled>Generate Video</button>
   <div id="status" class="status"></div>
 
@@ -177,8 +184,6 @@
     <h3>الفيديو الناتج</h3>
     <video id="resultVideo" controls playsinline></video>
     <a id="downloadResult" class="download" download="motion-studio-wan22.mp4">حفظ الفيديو MP4</a>
-    <button id="shareResult" class="btn secondary" type="button">مشاركة / حفظ على iPhone</button>
-    <button id="openResult" class="btn secondary" type="button">فتح الفيديو منفصل</button>
   </section>
 </div>
 
@@ -197,8 +202,8 @@ const statusBox = document.getElementById("status");
 const resultCard = document.getElementById("resultCard");
 const resultVideo = document.getElementById("resultVideo");
 const downloadResult = document.getElementById("downloadResult");
-const shareResult = document.getElementById("shareResult");
-const openResult = document.getElementById("openResult");
+const recoverJobId = document.getElementById("recoverJobId");
+const recoverJob = document.getElementById("recoverJob");
 
 let currentVideoBlob = null;
 let currentVideoUrl = null;
@@ -212,6 +217,7 @@ if (!savedEndpoint) {
 
 endpointIdInput.value = localStorage.getItem("runpodEndpointId") || DEFAULT_ENDPOINT;
 apiKeyInput.value = localStorage.getItem("runpodApiKey") || "";
+recoverJobId.value = localStorage.getItem("lastRunPodJobId") || "8ebee6c2-e85b-4b3e-bcf1-fa2e18bc9d78-e2";
 
 document.getElementById("saveConnection").addEventListener("click", () => {
   localStorage.setItem("runpodEndpointId", endpointIdInput.value.trim());
@@ -280,78 +286,119 @@ function base64ToBlob(base64, mimeType="video/mp4"){
   const byteChars = atob(base64);
   const chunkSize = 1024 * 1024;
   const chunks = [];
-
   for(let offset = 0; offset < byteChars.length; offset += chunkSize){
     const slice = byteChars.slice(offset, offset + chunkSize);
     const bytes = new Uint8Array(slice.length);
-
     for(let i = 0; i < slice.length; i++){
       bytes[i] = slice.charCodeAt(i);
     }
-
     chunks.push(bytes);
   }
-
   return new Blob(chunks, {type: mimeType});
 }
 
-function setVideoResult(base64, mimeType="video/mp4"){
+function showVideoFromOutput(output, jobId="video"){
+  if(!output || !output.video_base64){
+    throw new Error("النتيجة لا تحتوي على video_base64.");
+  }
+
   if(currentVideoUrl){
     URL.revokeObjectURL(currentVideoUrl);
   }
 
-  currentVideoBlob = base64ToBlob(base64, mimeType);
+  currentVideoBlob = base64ToBlob(
+    output.video_base64,
+    output.mime_type || "video/mp4"
+  );
   currentVideoUrl = URL.createObjectURL(currentVideoBlob);
 
   resultVideo.src = currentVideoUrl;
   resultVideo.load();
 
   downloadResult.href = currentVideoUrl;
-  downloadResult.download = "motion-studio-wan22.mp4";
+  downloadResult.download = `motion-studio-${jobId}.mp4`;
+
+  resultCard.style.display = "block";
+  resultCard.scrollIntoView({behavior:"smooth"});
+
+  showStatus(
+    `تم تجهيز الفيديو بنجاح.\n` +
+    `${output.width || "?"}×${output.height || "?"} — ` +
+    `${output.fps || 16} FPS — ` +
+    `${output.duration || "?"}s — ` +
+    `${output.num_frames || "?"} frames`
+  );
 }
 
-shareResult.addEventListener("click", async () => {
-  if(!currentVideoBlob){
-    showStatus("لا يوجد فيديو جاهز للحفظ.", true);
+async function recoverRunPodJob(endpointId, apiKey, jobId){
+  const statusUrl = `https://api.runpod.ai/v2/${endpointId}/status/${jobId}`;
+  const response = await fetch(statusUrl, {
+    headers: {"Authorization": `Bearer ${apiKey}`}
+  });
+  const data = await response.json();
+
+  if(!response.ok){
+    throw new Error(data?.error || data?.message || "تعذر جلب الـJob.");
+  }
+
+  if(data.status !== "COMPLETED"){
+    throw new Error(`حالة الـJob الحالية: ${data.status}`);
+  }
+
+  return data.output;
+}
+
+recoverJob.addEventListener("click", async () => {
+  const endpointId = endpointIdInput.value.trim();
+  const apiKey = apiKeyInput.value.trim();
+  const jobId = recoverJobId.value.trim();
+
+  if(!endpointId || !apiKey || !jobId){
+    showStatus("اكتب Endpoint ID و API Key و Job ID أولاً.", true);
     return;
   }
 
+  recoverJob.disabled = true;
+  showStatus(`جاري استرجاع الفيديو...\nJob ID: ${jobId}`);
+
+  try{
+    const output = await recoverRunPodJob(endpointId, apiKey, jobId);
+    showVideoFromOutput(output, jobId);
+  }catch(error){
+    console.error(error);
+    showStatus("فشل الاسترجاع:\n" + (error?.message || String(error)), true);
+  }finally{
+    recoverJob.disabled = false;
+  }
+});
+
+downloadResult.addEventListener("click", async (event) => {
+  if(!currentVideoBlob) return;
+
+  // On iPhone/iPad, Web Share is usually much more reliable than the download attribute.
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  if(!isIOS || !navigator.share) return;
+
+  event.preventDefault();
+
   const file = new File(
     [currentVideoBlob],
-    "motion-studio-wan22.mp4",
+    downloadResult.download || "motion-studio-video.mp4",
     {type: currentVideoBlob.type || "video/mp4"}
   );
 
   try{
-    if(navigator.share && (!navigator.canShare || navigator.canShare({files:[file]}))){
-      await navigator.share({
-        files:[file],
-        title:"Motion Studio Video"
-      });
+    if(!navigator.canShare || navigator.canShare({files:[file]})){
+      await navigator.share({files:[file], title:"Motion Studio Video"});
       return;
     }
-
-    // Fallback: trigger a normal download if file sharing is unavailable.
-    downloadResult.click();
   }catch(error){
-    if(error?.name !== "AbortError"){
-      console.error(error);
-      showStatus("تعذر فتح المشاركة. جرّب زر فتح الفيديو منفصل.", true);
-    }
-  }
-});
-
-openResult.addEventListener("click", () => {
-  if(!currentVideoUrl){
-    showStatus("لا يوجد فيديو جاهز للفتح.", true);
-    return;
+    if(error?.name === "AbortError") return;
+    console.error(error);
   }
 
-  const opened = window.open(currentVideoUrl, "_blank");
-  if(!opened){
-    // iOS/Safari may block popups; same-tab fallback keeps the generated file accessible.
-    window.location.href = currentVideoUrl;
-  }
+  // Fallback to the normal link if sharing is unavailable.
+  window.open(currentVideoUrl, "_blank");
 });
 
 async function callRunPod(endpointId, apiKey, payload){
@@ -376,6 +423,8 @@ async function callRunPod(endpointId, apiKey, payload){
   const jobId = runData.id;
   if(!jobId) throw new Error("RunPod لم يرجع Job ID.");
 
+  localStorage.setItem("lastRunPodJobId", jobId);
+  recoverJobId.value = jobId;
   showStatus(`تم إرسال الطلب.\nJob ID: ${jobId}\nجاري تشغيل Wan وتحميل الموديل...`);
 
   const statusUrl = `https://api.runpod.ai/v2/${endpointId}/status/${jobId}`;
@@ -458,33 +507,13 @@ generateButton.addEventListener("click", async () => {
       throw new Error("النتيجة لا تحتوي على video_base64.");
     }
 
-    setVideoResult(
-      output.video_base64,
-      output.mime_type || "video/mp4"
-    );
-
-    resultCard.style.display = "block";
-    showStatus(
-      `تم إنشاء الفيديو بنجاح.\n` +
-      `${output.width || "?"}×${output.height || "?"} — ` +
-      `${output.fps || 16} FPS — ` +
-      `${output.duration || document.getElementById("duration").value}s — ` +
-      `${output.num_frames || "?"} frames`
-    );
-
-    resultCard.scrollIntoView({behavior:"smooth"});
+    showVideoFromOutput(output, "latest");
 
   }catch(error){
     console.error(error);
     showStatus("فشل الطلب:\n" + (error?.message || String(error)), true);
   }finally{
     updateButton();
-  }
-});
-
-window.addEventListener("pagehide", () => {
-  if(currentVideoUrl){
-    URL.revokeObjectURL(currentVideoUrl);
   }
 });
 
