@@ -177,6 +177,8 @@
     <h3>الفيديو الناتج</h3>
     <video id="resultVideo" controls playsinline></video>
     <a id="downloadResult" class="download" download="motion-studio-wan22.mp4">حفظ الفيديو MP4</a>
+    <button id="shareResult" class="btn secondary" type="button">مشاركة / حفظ على iPhone</button>
+    <button id="openResult" class="btn secondary" type="button">فتح الفيديو منفصل</button>
   </section>
 </div>
 
@@ -195,6 +197,11 @@ const statusBox = document.getElementById("status");
 const resultCard = document.getElementById("resultCard");
 const resultVideo = document.getElementById("resultVideo");
 const downloadResult = document.getElementById("downloadResult");
+const shareResult = document.getElementById("shareResult");
+const openResult = document.getElementById("openResult");
+
+let currentVideoBlob = null;
+let currentVideoUrl = null;
 
 const DEFAULT_ENDPOINT = "v404idbmwhr45o";
 
@@ -267,6 +274,85 @@ function fileToDataUrl(file){
     reader.readAsDataURL(file);
   });
 }
+
+
+function base64ToBlob(base64, mimeType="video/mp4"){
+  const byteChars = atob(base64);
+  const chunkSize = 1024 * 1024;
+  const chunks = [];
+
+  for(let offset = 0; offset < byteChars.length; offset += chunkSize){
+    const slice = byteChars.slice(offset, offset + chunkSize);
+    const bytes = new Uint8Array(slice.length);
+
+    for(let i = 0; i < slice.length; i++){
+      bytes[i] = slice.charCodeAt(i);
+    }
+
+    chunks.push(bytes);
+  }
+
+  return new Blob(chunks, {type: mimeType});
+}
+
+function setVideoResult(base64, mimeType="video/mp4"){
+  if(currentVideoUrl){
+    URL.revokeObjectURL(currentVideoUrl);
+  }
+
+  currentVideoBlob = base64ToBlob(base64, mimeType);
+  currentVideoUrl = URL.createObjectURL(currentVideoBlob);
+
+  resultVideo.src = currentVideoUrl;
+  resultVideo.load();
+
+  downloadResult.href = currentVideoUrl;
+  downloadResult.download = "motion-studio-wan22.mp4";
+}
+
+shareResult.addEventListener("click", async () => {
+  if(!currentVideoBlob){
+    showStatus("لا يوجد فيديو جاهز للحفظ.", true);
+    return;
+  }
+
+  const file = new File(
+    [currentVideoBlob],
+    "motion-studio-wan22.mp4",
+    {type: currentVideoBlob.type || "video/mp4"}
+  );
+
+  try{
+    if(navigator.share && (!navigator.canShare || navigator.canShare({files:[file]}))){
+      await navigator.share({
+        files:[file],
+        title:"Motion Studio Video"
+      });
+      return;
+    }
+
+    // Fallback: trigger a normal download if file sharing is unavailable.
+    downloadResult.click();
+  }catch(error){
+    if(error?.name !== "AbortError"){
+      console.error(error);
+      showStatus("تعذر فتح المشاركة. جرّب زر فتح الفيديو منفصل.", true);
+    }
+  }
+});
+
+openResult.addEventListener("click", () => {
+  if(!currentVideoUrl){
+    showStatus("لا يوجد فيديو جاهز للفتح.", true);
+    return;
+  }
+
+  const opened = window.open(currentVideoUrl, "_blank");
+  if(!opened){
+    // iOS/Safari may block popups; same-tab fallback keeps the generated file accessible.
+    window.location.href = currentVideoUrl;
+  }
+});
 
 async function callRunPod(endpointId, apiKey, payload){
   const runUrl = `https://api.runpod.ai/v2/${endpointId}/run`;
@@ -372,10 +458,11 @@ generateButton.addEventListener("click", async () => {
       throw new Error("النتيجة لا تحتوي على video_base64.");
     }
 
-    const dataUrl = `data:${output.mime_type || "video/mp4"};base64,${output.video_base64}`;
+    setVideoResult(
+      output.video_base64,
+      output.mime_type || "video/mp4"
+    );
 
-    resultVideo.src = dataUrl;
-    downloadResult.href = dataUrl;
     resultCard.style.display = "block";
     showStatus(
       `تم إنشاء الفيديو بنجاح.\n` +
@@ -392,6 +479,12 @@ generateButton.addEventListener("click", async () => {
     showStatus("فشل الطلب:\n" + (error?.message || String(error)), true);
   }finally{
     updateButton();
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  if(currentVideoUrl){
+    URL.revokeObjectURL(currentVideoUrl);
   }
 });
 
